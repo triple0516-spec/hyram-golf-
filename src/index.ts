@@ -1,4 +1,4 @@
-interface Env { DB: D1Database }
+interface Env { DB: D1Database; ALLOWED_ORIGIN?: string }
 const encoder = new TextEncoder();
 const hex = (a: Uint8Array) => [...a].map(v => v.toString(16).padStart(2, "0")).join("");
 const bytes = (n: number) => crypto.getRandomValues(new Uint8Array(n));
@@ -7,6 +7,8 @@ async function passwordHash(password: string, salt: string) {
  const key = await crypto.subtle.importKey("raw", encoder.encode(password), "PBKDF2", false, ["deriveBits"]);
  return hex(new Uint8Array(await crypto.subtle.deriveBits({name:"PBKDF2",salt:Uint8Array.from(salt.match(/../g)!.map(x=>parseInt(x,16))),iterations:310000,hash:"SHA-256"},key,256)));
 }
+const isSameOrigin=(req:Request,env:Env)=>{const origin=req.headers.get("origin"); if(!origin)return false; const expected=env.ALLOWED_ORIGIN||new URL(req.url).origin;return origin===expected;};
+const limited=async(env:Env,key:string,max:number,windowMs:number)=>{const bucket=Math.floor(Date.now()/windowMs);await env.DB.prepare("INSERT INTO rate_limits (key,bucket,count) VALUES (?,?,1) ON CONFLICT(key,bucket) DO UPDATE SET count=count+1").bind(key,bucket).run();const row=await env.DB.prepare("SELECT count FROM rate_limits WHERE key=? AND bucket=?").bind(key,bucket).first<{count:number}>();return (row?.count||0)>max;};
 const json=(data:unknown,status=200,headers:HeadersInit={})=>new Response(JSON.stringify(data),{status,headers:{"content-type":"application/json; charset=utf-8","cache-control":"no-store",...headers}});
 const cookie=(token:string,maxAge:number)=>`hyram_session=${token}; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=${maxAge}`;
 async function currentUser(req:Request,env:Env) {
@@ -16,6 +18,8 @@ async function currentUser(req:Request,env:Env) {
 }
 export default {async fetch(req:Request,env:Env):Promise<Response>{
  const url=new URL(req.url),path=url.pathname;
+ if(req.method==="POST"&&!isSameOrigin(req,env))return json({error:"허용되지 않은 요청 출처입니다."},403);
+ if(req.method==="POST"&&await limited(env,"ip:"+ (req.headers.get("cf-connecting-ip")||"unknown")+":"+path,20,60000))return json({error:"요청이 너무 많습니다. 잠시 후 다시 시도하세요."},429,{"retry-after":"60"});
  if(path==="/api/auth/me"&&req.method==="GET"){const user=await currentUser(req,env);return user?json({user}):json({error:"인증이 필요합니다."},401);}
  if(path==="/api/auth/logout"&&req.method==="POST"){
   const token=req.headers.get("cookie")?.match(/(?:^|;\s*)hyram_session=([a-f0-9]{64})(?:;|$)/)?.[1];
@@ -26,7 +30,7 @@ export default {async fetch(req:Request,env:Env):Promise<Response>{
   if(req.headers.get("content-type")?.split(";")[0].trim()!=="application/json")return json({error:"JSON 요청만 허용됩니다."},415);
   if(Number(req.headers.get("content-length")||0)>4096)return json({error:"요청이 너무 큽니다."},413);
   let body:Record<string,unknown>;
-  try{body=await req.json() as Record<string,unknown>;}catch{return json({error:"JSON 형식 오류"},400);}
+  try{const raw=await req.text();if(raw.length>4096)return json({error:"요청이 너무 큽니다."},413);const parsed:unknown=JSON.parse(raw);if(!parsed||typeof parsed!=="object"||Array.isArray(parsed))return json({error:"JSON 객체가 필요합니다."},400);body=parsed as Record<string,unknown>;}catch{return json({error:"JSON 형식 오류"},400);}
   const email=typeof body.email==="string"?body.email.trim().toLowerCase():"";
   const password=typeof body.password==="string"?body.password:"";
   if(!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)||email.length>254||password.length<12||password.length>128)return json({error:"이메일 또는 비밀번호 형식이 올바르지 않습니다. 비밀번호는 12~128자여야 합니다."},400);
