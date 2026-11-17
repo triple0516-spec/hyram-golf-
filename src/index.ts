@@ -20,6 +20,17 @@ export default {async fetch(req:Request,env:Env):Promise<Response>{
  const url=new URL(req.url),path=url.pathname;
  if(req.method==="POST"&&!isSameOrigin(req,env))return json({error:"허용되지 않은 요청 출처입니다."},403);
  if(req.method==="POST"&&await limited(env,"ip:"+ (req.headers.get("cf-connecting-ip")||"unknown")+":"+path,20,60000))return json({error:"요청이 너무 많습니다. 잠시 후 다시 시도하세요."},429,{"retry-after":"60"});
+ if(path==="/api/business/me"&&req.method==="GET"){const user=await currentUser(req,env);if(!user)return json({error:"로그인이 필요합니다."},401);const application=await env.DB.prepare("SELECT company_name,business_registration_number,representative_name,status,submitted_at FROM business_applications WHERE user_id=?").bind(user.id).first();return json({application});}
+ if(path==="/api/business/apply"&&req.method==="POST"){
+  const user=await currentUser(req,env);if(!user)return json({error:"로그인이 필요합니다."},401);
+  if(req.headers.get("content-type")?.split(";")[0].trim()!=="application/json")return json({error:"JSON 요청만 허용됩니다."},415);
+  let data:Record<string,unknown>;try{const raw=await req.text();if(raw.length>4096)return json({error:"요청이 너무 큽니다."},413);const parsed:unknown=JSON.parse(raw);if(!parsed||typeof parsed!=="object"||Array.isArray(parsed))throw Error();data=parsed as Record<string,unknown>;}catch{return json({error:"요청 형식 오류"},400);}
+  const company=typeof data.company_name==="string"?data.company_name.trim():"";const representative=typeof data.representative_name==="string"?data.representative_name.trim():"";const number=typeof data.business_registration_number==="string"?data.business_registration_number.replace(/-/g,""):"";
+  if(!company||company.length>120||!representative||representative.length>80||!/^\\d{10}$/.test(number))return json({error:"사업자 정보를 확인해 주세요."},400);
+  const existing=await env.DB.prepare("SELECT id FROM business_applications WHERE user_id=?").bind(user.id).first();if(existing)return json({error:"이미 신청한 내역이 있습니다."},409);
+  await env.DB.prepare("INSERT INTO business_applications(id,user_id,company_name,business_registration_number,representative_name) VALUES(?,?,?,?,?)").bind(crypto.randomUUID(),user.id,company,number,representative).run();
+  return json({status:"pending"},201);
+ }
  if(path==="/api/auth/me"&&req.method==="GET"){const user=await currentUser(req,env);return user?json({user}):json({error:"인증이 필요합니다."},401);}
  if(path==="/api/auth/logout"&&req.method==="POST"){
   const token=req.headers.get("cookie")?.match(/(?:^|;\s*)hyram_session=([a-f0-9]{64})(?:;|$)/)?.[1];
